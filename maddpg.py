@@ -8,6 +8,9 @@ import numpy as np
 import random
 from collections import deque
 
+from skimage.color import rgb2gray
+from skimage.transform import resize
+
 from pettingzoo.butterfly import pistonball_v6
 
 class ReplayBuffer():
@@ -27,9 +30,21 @@ class ReplayBuffer():
         return states, actions, rewards, next_states, dones
 
 class ActorNet(nn.Module):
-    def __init__(self, state_num, action_num, min_action, max_action):
+    def __init__(self, input, action_num, min_action, max_action):
         super(ActorNet, self).__init__()
-        self.input = nn.Linear(state_num, 256)
+        self.input_channel = input[0]
+        self.input_height = input[1]
+        self.input_width = input[2]
+        
+        self.conv1 = nn.Conv2d(self.input_channel, 32, kernel_size=8, stride=4)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=2, stride=1)
+        
+        h = self.output_layer_size(self.output_layer_size(self.output_layer_size(self.input_height, 8, 4), 4, 2), 2, 1)
+        w = self.output_layer_size(self.output_layer_size(self.output_layer_size(self.input_width, 8, 4), 4, 2), 2, 1)
+        fc_input_size = h * w * 64
+        
+        self.input = nn.Linear(fc_input_size, 256)
         self.fc = nn.Linear(256, 512)
         self.output = nn.Linear(512, action_num)
 
@@ -38,54 +53,83 @@ class ActorNet(nn.Module):
         self.max_action = max_action
     
     def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = x.view(x.size(0), -1)
+        
         x = F.relu(self.input(x))
         x = F.relu(self.fc(x))
         action = self.output(x)
         action = torch.clamp(action, self.min_action, self.max_action)
         return action
+    
+    def output_layer_size(self, size, kernel_size, stride):
+        return (size - kernel_size) // stride + 1
 
 class CriticNet(nn.Module):
-    def __init__(self, state_num, action_num):
+    def __init__(self, input, action_num):
         super(CriticNet, self).__init__()
-        self.input = nn.Linear(state_num + action_num, 256)
+        self.input_channel = input[0]
+        self.input_height = input[1]
+        self.input_width = input[2]
+        
+        self.conv1 = nn.Conv2d(self.input_channel, 32, kernel_size=8, stride=4)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=2, stride=1)
+        
+        h = self.output_layer_size(self.output_layer_size(self.output_layer_size(self.input_height, 8, 4), 4, 2), 2, 1)
+        w = self.output_layer_size(self.output_layer_size(self.output_layer_size(self.input_width, 8, 4), 4, 2), 2, 1)
+        fc_input_size = h * w * 64
+        
+        self.input = nn.Linear(fc_input_size, 256)
         self.fc = nn.Linear(256, 512)
-        self.output = nn.Linear(512, 1)
+        self.output = nn.Linear(512, action_num)
     
     def forward(self, x, u):
-        x = torch.cat([x, u], 1)
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = x.view(x.size(0), -1)
+        
         x = F.relu(self.input(x))
         x = F.relu(self.fc(x))
         value = self.output(x)
         return value
     
+    def output_layer_size(self, size, kernel_size, stride):
+        return (size - kernel_size) // stride + 1
+    
 class MADDPG():
-    def __init__(self, env, n_agents, memory_size=10000000, batch_size=64, tau=0.01, gamma=0.95, learning_rate=1e-3, eps_min=0.05, eps_period=10000):
+    def __init__(self, env, n_agents, chw=[1, 84, 84], memory_size=10000000, batch_size=64, tau=0.01, gamma=0.95, learning_rate=1e-3, eps_min=0.05, eps_period=10000):
         super(MADDPG, self).__init__()
         self.env = env
-        self.state_num = self.env.observation_space.shape[0]
-        self.action_num = self.env.action_space.shape[0]
-        self.action_max = float(env.action_space.high[0])
-        self.action_min = float(env.action_space.low[0])
+        self.chw = chw
+        self.action_num = 1
+        self.action_max = 1.0
+        self.action_min = -1.0
         self.n_agents = n_agents
                 
         # Torch
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # Actors
-        self.actors_net = [ActorNet(self.state_num, self.action_num, self.action_min, self.action_max).to(self.device) for _ in range(self.n_agents)]
+        self.actors_net = [ActorNet(self.chw, self.action_num, self.action_min, self.action_max).to(self.device) for _ in range(self.n_agents)]
         self.actors_opt = [optim.Adam(n.parameters(), lr=learning_rate) for n in self.actors_net]
         
         # Target Actors
-        self.actors_target_net = [ActorNet(self.state_num, self.action_num, self.action_min, self.action_max).to(self.device) for _ in range(self.n_agents)]
-        self.actors_target_net.load_state_dict(self.actors_net.state_dict())
+        self.actors_target_net = [ActorNet(self.chw, self.action_num, self.action_min, self.action_max).to(self.device) for _ in range(self.n_agents)]
+        for i in range(self.n_agents):
+            self.actors_target_net[i].load_state_dict(self.actors_net[i].state_dict())
         
         # Critics
-        self.critics_net = [CriticNet(self.state_num, self.action_num).to(self.device) for _ in range(self.n_agents)]
+        self.critics_net = [CriticNet(self.chw, self.action_num).to(self.device) for _ in range(self.n_agents)]
         self.critics_opt = [optim.Adam(n.parameters(), lr=learning_rate) for n in self.critics_net]
         
         # Target Critics
-        self.critics_target_net = [CriticNet(self.state_num, self.action_num).to(self.device) for _ in range(self.n_agents)]
-        self.critics_target_net.load_state_dict(self.critics_net.state_dict())
+        self.critics_target_net = [CriticNet(self.chw, self.action_num).to(self.device) for _ in range(self.n_agents)]
+        for i in range(self.n_agents):
+            self.critics_target_net[i].load_state_dict(self.critics_net[i].state_dict())
         
         # Replay buffer
         self.replay_buffer = ReplayBuffer(memory_size)
@@ -164,41 +208,46 @@ class MADDPG():
             self.soft_update(self.critics_net[i], self.critics_target_net[i])
             self.soft_update(self.actors_net[i], self.actors_target_net[i])
 
+def pre_processing(img, h=84, w=84):
+    return np.uint8(resize(rgb2gray(img), (h, w), mode='constant') * 255)
 
 def main():
     env = pistonball_v6.env(n_pistons=20, time_penalty=-0.1, continuous=True, random_drop=True, random_rotate=True,
                             ball_mass=0.75, ball_friction=0.3, ball_elasticity=1.5, max_cycles=125)
     
-    # agent = MADDPG(env, n_agents=20, memory_size=100000, batch_size=64, tau=0.01, gamma=0.95, learning_rate=1e-3, eps_min=0.00001, eps_period=100000)
-    # ep_rewards = deque(maxlen=1)
-    # total_episode = 10000
+    agent = MADDPG(env, n_agents=20, chw=[4, 84, 84], memory_size=100000, batch_size=64, tau=0.01, gamma=0.95, learning_rate=1e-3, eps_min=0.00001, eps_period=100000)
+    ep_rewards = deque(maxlen=1)
+    total_episode = 10000
     
-    env.reset()
-    for agent in env.agent_iter():
-        observation, reward, done, info = env.last()
-        print(observation)
-        action = agent.get_action(observation)
-        env.step(action)
-    
-    # for i in range(total_episode):
-    #     state = env.reset()
-    #     ep_reward = 0
-    #     while True:
-    #         action = agent.get_action(state, True)
-    #         next_state, reward , done, _ = env.step(action)
-    #         ep_reward += reward
-
-    #         agent.replay_buffer.add(state, action, reward, next_state, done)
-    #         if i > 2:
-    #             agent.learn()
+    for i in range(total_episode):
+        env.reset()
+        
+        obs, _, _, _ = env.last()
+        obs = pre_processing(obs)
+        history = np.stack((obs, obs, obs, obs), axis=0)
+        ep_reward = 0
+        
+        for _ in env.agent_iter():
+            action = agent.get_action(history)
+            env.step(action)
+            next_obs, reward, done, _ = env.last()
             
-    #         if done:
-    #             ep_rewards.append(ep_reward)
-    #             if i % 1 == 0:
-    #                 print("episode: {}\treward: {}".format(i, round(np.mean(ep_rewards), 3)))
-    #             break
+            next_obs = pre_processing(next_obs)
+            next_history = np.append([next_obs], history[:history.shape[0]-1, :, :], axis=0)
+            
+            agent.replay_buffer.add(history, action, reward, next_history, done)
 
-    #         state = next_state
+            if i > 2:
+                agent.learn()
+                
+            if done:
+                ep_rewards.append(ep_reward)
+                if i % 1 == 0:
+                    print("episode: {}\treward: {}".format(i, round(np.mean(ep_rewards), 3)))
+                break
+            
+            history = next_history
+
 
 if __name__ == '__main__':
     main()

@@ -145,28 +145,24 @@ class MADDPG():
         self.eps_period = eps_period
 
     # Get the action
-    def get_action(self, states, exploration=True):
-        actions = []
+    def get_action(self, states, agent_num, exploration=True):
 
-        for i in range(self.n_agents):
-            state = torch.FloatTensor(states[i, :]).unsqueeze(0).to(self.device)
-            action = self.actors_net[i](state).cpu().detach().numpy().flatten()
+        state = torch.FloatTensor(states).unsqueeze(0).to(self.device)
+        action = self.actors_net[agent_num](state).cpu().detach().numpy().flatten()
+        
+        if exploration:
+            # Get noise (gaussian distribution with epsilon greedy)
+            action_mean = (self.action_max + self.action_min) / 2
+            action_std = (self.action_max - self.action_min) / 2
+            action_noise = np.random.normal(action_mean, action_std, 1)[0]
+            action_noise *= self.epsilon
+            self.epsilon = self.epsilon - (1 - self.eps_min) / self.eps_period if self.epsilon > self.eps_min else self.eps_min
             
-            if exploration:
-                # Get noise (gaussian distribution with epsilon greedy)
-                action_mean = (self.action_max + self.action_min) / 2
-                action_std = (self.action_max - self.action_min) / 2
-                action_noise = np.random.normal(action_mean, action_std, 1)[0]
-                action_noise *= self.epsilon
-                self.epsilon = self.epsilon - (1 - self.eps_min) / self.eps_period if self.epsilon > self.eps_min else self.eps_min
-                
-                # Final action
-                action = action + action_noise
-                action = np.clip(action, self.action_min, self.action_max)
-                
-            actions.append(action)
-            
-        return actions
+            # Final action
+            action = action + action_noise
+            action = np.clip(action, self.action_min, self.action_max)
+        
+        return action
 
     # Soft update a target network
     def soft_update(self, net, target_net):
@@ -176,30 +172,35 @@ class MADDPG():
     # Learn the policy
     def learn(self):
         # Replay buffer
-        states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
-        states = torch.FloatTensor(states).to(self.device)
+        histories, actions, rewards, next_histories, dones = self.replay_buffer.sample(self.batch_size)
+        histories = torch.FloatTensor(histories).to(self.device)
         actions = torch.FloatTensor(actions).to(self.device)
         rewards = torch.FloatTensor(rewards).to(self.device)
-        next_states = torch.FloatTensor(next_states).to(self.device)
+        next_histories = torch.FloatTensor(next_histories).to(self.device)
         dones = torch.FloatTensor(dones).to(self.device)
         
+        next_actions = [self.actors_target_net[i](next_histories) for i in range(self.n_agents)]
+        
         for i in range(self.n_agents):
+            
+            # actions = actions_all[range(self.n_agents), [i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i]]
+            # rewards = rewards_all[range(self.n_agents), [i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i]]
+            
             # Target Q values
-            next_actions = self.actors_target_net[i](next_states)
-            target_q = self.critics_target_net[i](next_states, next_actions).view(1, -1)
-            target_q = (rewards + self.gamma * target_q * (1-dones))
+            target_q = self.critics_target_net[i](next_histories, next_actions).view(1, -1)
+            target_q = (rewards[:, i] + self.gamma * target_q * (1-dones))
 
             # Current Q values
-            values = self.critics_net[i](states, actions).view(1, -1)
+            values = self.critics_net[i](histories, actions).view(1, -1)
             
             # Calculate the critic loss and optimize the critic network
             critic_loss = F.mse_loss(values, target_q)
             self.critics_opt[i].zero_grad()
             critic_loss.backward()
             self.critics_opt[i].step()
-            
+        
             # Calculate the actor loss and optimize the actor network
-            actor_loss = -self.critics_net[i](states, self.actors_net[i](states)).mean()
+            actor_loss = -self.critics_net[i](histories, self.actors_net[i](histories)).mean()
             self.actors_opt[i].zero_grad()
             actor_loss.backward()
             self.actors_opt[i].step()
@@ -221,21 +222,28 @@ def main():
     
     for i in range(total_episode):
         env.reset()
-        
         obs, _, _, _ = env.last()
         obs = pre_processing(obs)
         history = np.stack((obs, obs, obs, obs), axis=0)
         ep_reward = 0
         
-        for _ in env.agent_iter():
-            action = agent.get_action(history)
-            env.step(action)
-            next_obs, reward, done, _ = env.last()
+        while True:
+            actions = []
+            rewards = []
             
-            next_obs = pre_processing(next_obs)
-            next_history = np.append([next_obs], history[:history.shape[0]-1, :, :], axis=0)
-            
-            agent.replay_buffer.add(history, action, reward, next_history, done)
+            # Get and supply actions.
+            for j in range(agent.n_agents):
+                action = agent.get_action(history, j)
+                env.step(action)
+                
+                obs, reward, done, _ = env.last()
+                
+                actions.append(action)
+                rewards.append(reward)
+                
+            obs = pre_processing(obs)
+            next_history = np.append([obs], history[:history.shape[0]-1, :, :], axis=0)
+            agent.replay_buffer.add(history, actions, rewards, next_history, done)
 
             if i > 2:
                 agent.learn()

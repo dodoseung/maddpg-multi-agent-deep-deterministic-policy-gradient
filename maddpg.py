@@ -43,56 +43,62 @@ class ActorNet(nn.Module):
         action = self.output(x)
         action = torch.clamp(action, self.min_action, self.max_action)
         return action
-    
-    def output_layer_size(self, size, kernel_size, stride):
-        return (size - kernel_size) // stride + 1
 
 class CriticNet(nn.Module):
-    def __init__(self, state_num, action_num):
+    def __init__(self, states_num, action_num, actions_num):
         super(CriticNet, self).__init__()
-        self.input = nn.Linear(state_num, 256)
+        self.input = nn.Linear(states_num + actions_num, 256)
         self.fc = nn.Linear(256, 512)
         self.output = nn.Linear(512, action_num)
     
-    def forward(self, x, u):
-        x = torch.cat([x, u], 1)        
+    def forward(self, xs, us):
+        x = torch.cat([xs, us], 1)        
         x = F.relu(self.input(x))
         x = F.relu(self.fc(x))
         value = self.output(x)
         return value
     
-    def output_layer_size(self, size, kernel_size, stride):
-        return (size - kernel_size) // stride + 1
-    
 class MADDPG():
     def __init__(self, env, n_agents, memory_size=10000000, batch_size=64, tau=0.01, gamma=0.95, learning_rate=1e-3, eps_min=0.05, eps_period=10000):
         super(MADDPG, self).__init__()
         self.env = env
-        self.state_num = self.env.observation_space[0].shape[0]
-        self.action_num = self.env.action_space.shape[0]
-        self.action_max = float(env.action_space.high[0])
-        self.action_min = float(env.action_space.low[0])
         self.n_agents = n_agents
                 
         # Torch
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Actors
-        self.actors_net = [ActorNet(self.state_num, self.action_num, self.action_min, self.action_max).to(self.device) for _ in range(self.n_agents)]
-        self.actors_opt = [optim.Adam(n.parameters(), lr=learning_rate) for n in self.actors_net]
+        # Networks and optimizers
+        self.actors_net = []
+        self.actors_opt = []
+        self.actors_target_net = []
+        self.critics_net = []
+        self.critics_opt = []
+        self.critics_target_net = []
         
-        # Target Actors
-        self.actors_target_net = [ActorNet(self.state_num, self.action_num, self.action_min, self.action_max).to(self.device) for _ in range(self.n_agents)]
-        for i in range(self.n_agents):
+        # Total number of states and actions
+        self.states_num = sum([self.env.observation_spaces[agent].shape[0] for agent in self.env.agents])
+        self.actions_num = sum([self.env.action_spaces[agent].shape[0] for agent in self.env.agents])
+        
+        for i, agent in enumerate(self.env.agents):
+            self.state_num = self.env.observation_spaces[agent].shape[0]
+            self.action_num = self.env.action_spaces[agent].shape[0]
+            self.action_max = float(env.action_spaces[agent].high[0])
+            self.action_min = float(env.action_spaces[agent].low[0])
+            
+            # Actors
+            self.actors_net.append(ActorNet(self.state_num, self.action_num, self.action_min, self.action_max).to(self.device))
+            self.actors_opt = optim.Adam(self.actors_net[i].parameters(), lr=learning_rate)
+            
+            # Target Actors
+            self.actors_target_net.append(ActorNet(self.state_num, self.action_num, self.action_min, self.action_max).to(self.device))
             self.actors_target_net[i].load_state_dict(self.actors_net[i].state_dict())
-        
-        # Critics
-        self.critics_net = [CriticNet(self.state_num, self.action_num).to(self.device) for _ in range(self.n_agents)]
-        self.critics_opt = [optim.Adam(n.parameters(), lr=learning_rate) for n in self.critics_net]
-        
-        # Target Critics
-        self.critics_target_net = [CriticNet(self.state_num, self.action_num).to(self.device) for _ in range(self.n_agents)]
-        for i in range(self.n_agents):
+            
+            # Critics
+            self.critics_net.append(CriticNet(self.states_num, self.action_num, self.actions_num).to(self.device))
+            self.critics_opt = optim.Adam(self.critics_net[i].parameters(), lr=learning_rate)
+            
+            # Target Critics
+            self.critics_target_net.append(CriticNet(self.states_num, self.action_num, self.actions_num).to(self.device))
             self.critics_target_net[i].load_state_dict(self.critics_net[i].state_dict())
         
         # Replay buffer
@@ -109,20 +115,22 @@ class MADDPG():
         self.eps_period = eps_period
 
     # Get the action
-    def get_action(self, states, agent_num, exploration=True):
+    def get_action(self, states, agent, exploration=True):
         state = torch.FloatTensor(states).unsqueeze(0).to(self.device)
-        action = self.actors_net[agent_num](state).cpu().detach().numpy().flatten()
-        
+        action = self.actors_net[agent](state).cpu().detach().numpy().flatten()
+
         if exploration:
             # Get noise (gaussian distribution with epsilon greedy)
             action_mean = (self.action_max + self.action_min) / 2
             action_std = (self.action_max - self.action_min) / 2
-            action_noise = np.random.normal(action_mean, action_std, 1)[0]
+            action_num = self.env.action_spaces[self.env.agents[agent]].shape[0]
+            action_noise = np.random.normal(action_mean, action_std, action_num)
             action_noise *= self.epsilon
             self.epsilon = self.epsilon - (1 - self.eps_min) / self.eps_period if self.epsilon > self.eps_min else self.eps_min
             
             # Final action
-            action = action + action_noise
+            # action = action + action_noise
+            action = action * 0.9
             action = np.clip(action, self.action_min, self.action_max)
         
         return action
@@ -136,30 +144,40 @@ class MADDPG():
     def learn(self):
         # Replay buffer
         states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
-        states = torch.FloatTensor(states).to(self.device)
-        actions = torch.FloatTensor(actions).to(self.device)
-        rewards = torch.FloatTensor(rewards).to(self.device)
+        states_all = torch.FloatTensor(states).to(self.device)
+        actions_all = torch.FloatTensor(actions).to(self.device)
+        rewards_all = torch.FloatTensor(rewards).to(self.device)
         next_states = torch.FloatTensor(next_states).to(self.device)
         dones = torch.FloatTensor(dones).to(self.device)
         
-        next_actions = [self.actors_target_net[i](next_states) for i in range(self.n_agents)]
+        # Get next actions of all agents
+        next_actions_all = [self.actors_target_net[i](next_states) for i in range(self.n_agents)]
         
         for i in range(self.n_agents):
+            # Actions and rewards for a single agent
+            observations = states_all[i]
+            actions = actions_all[i]
+            rewards = rewards_all[i]
+            
             # Target Q values
-            target_q = self.critics_target_net[i](next_states, next_actions).view(1, -1)
+            target_q = self.critics_target_net[i](next_states, next_actions_all).view(1, -1)
             target_q = (rewards[:, i] + self.gamma * target_q * (1-dones))
 
             # Current Q values
-            values = self.critics_net[i](states, actions).view(1, -1)
+            values = self.critics_net[i](states_all, actions_all).view(1, -1)
             
             # Calculate the critic loss and optimize the critic network
             critic_loss = F.mse_loss(values, target_q)
             self.critics_opt[i].zero_grad()
             critic_loss.backward()
             self.critics_opt[i].step()
-        
+
+            # Calculate new actions of the current agent
+            new_actions = self.actors_net[i](observations)
+            new_actions_all = actions_all[:i] + new_actions + actions_all[i+1:]
+
             # Calculate the actor loss and optimize the actor network
-            actor_loss = -self.critics_net[i](states, self.actors_net[i](states)).mean()
+            actor_loss = -self.critics_net[i](states_all, new_actions_all).mean()
             self.actors_opt[i].zero_grad()
             actor_loss.backward()
             self.actors_opt[i].step()
@@ -171,28 +189,33 @@ class MADDPG():
 
 def main():
     env = simple_adversary_v2.env(N=2, max_cycles=25, continuous_actions=True)
+    env.reset()
+
     agent = MADDPG(env, n_agents=3, memory_size=100000, batch_size=64, tau=0.01, gamma=0.95, learning_rate=1e-3, eps_min=0.00001, eps_period=100000)
     ep_rewards = deque(maxlen=1)
     total_episode = 10000
     
     for i in range(total_episode):
-        state = env.reset()
+        env.reset()
         ep_reward = 0
         while True:
+            states = []
             actions = []
             rewards = []
             
             # Get and supply actions.
-            for j in range(agent.n_agents):
-                action = agent.get_action(state, j)
+            for j, agent_name in enumerate(agent.env.agents):
+                obs = env.observe(agent_name)
+                action = agent.get_action(obs, j)
                 env.step(action)
                 
                 next_state, reward, done, _ = env.last()
                 
+                states.append(obs)
                 actions.append(action)
                 rewards.append(reward)
 
-            agent.replay_buffer.add(state, actions, rewards, next_state, done)
+            agent.replay_buffer.add(states, actions, rewards, next_state, done)
 
             if i > 2:
                 agent.learn()

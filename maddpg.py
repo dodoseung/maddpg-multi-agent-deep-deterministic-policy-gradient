@@ -1,4 +1,5 @@
 # Lillicrap, Timothy P., et al. "Continuous control with deep reinforcement learning." arXiv preprint arXiv:1509.02971 (2015).
+from audioop import avg
 import torch
 import torch.optim as optim
 import torch.nn as nn
@@ -129,8 +130,7 @@ class MADDPG():
             self.epsilon = self.epsilon - (1 - self.eps_min) / self.eps_period if self.epsilon > self.eps_min else self.eps_min
             
             # Final action
-            # action = action + action_noise
-            action = action * 0.9
+            action += action_noise
             action = np.clip(action, self.action_min, self.action_max)
         
         return action
@@ -144,14 +144,15 @@ class MADDPG():
     def learn(self):
         # Replay buffer
         states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
-        states_all = torch.FloatTensor(states).to(self.device)
+        print(states[0])
+        states_all = [torch.FloatTensor(s).to(self.device) for s in states]
         actions_all = torch.FloatTensor(actions).to(self.device)
         rewards_all = torch.FloatTensor(rewards).to(self.device)
-        next_states = torch.FloatTensor(next_states).to(self.device)
+        next_states_all = torch.FloatTensor(next_states).to(self.device)
         dones = torch.FloatTensor(dones).to(self.device)
         
         # Get next actions of all agents
-        next_actions_all = [self.actors_target_net[i](next_states) for i in range(self.n_agents)]
+        next_actions_all = [self.actors_target_net[i](next_states_all[i]) for i in range(self.n_agents)]
         
         for i in range(self.n_agents):
             # Actions and rewards for a single agent
@@ -160,7 +161,7 @@ class MADDPG():
             rewards = rewards_all[i]
             
             # Target Q values
-            target_q = self.critics_target_net[i](next_states, next_actions_all).view(1, -1)
+            target_q = self.critics_target_net[i](next_states_all, next_actions_all).view(1, -1)
             target_q = (rewards[:, i] + self.gamma * target_q * (1-dones))
 
             # Current Q values
@@ -197,11 +198,12 @@ def main():
     
     for i in range(total_episode):
         env.reset()
-        ep_reward = 0
+        ep_reward = [0] * agent.n_agents
         while True:
             states = []
             actions = []
             rewards = []
+            next_states = []
             
             # Get and supply actions.
             for j, agent_name in enumerate(agent.env.agents):
@@ -210,12 +212,13 @@ def main():
                 env.step(action)
                 
                 next_state, reward, done, _ = env.last()
-                
-                states.append(obs)
+                states.extend(obs)
                 actions.append(action)
                 rewards.append(reward)
-
-            agent.replay_buffer.add(states, actions, rewards, next_state, done)
+                next_states.append(next_state)
+                
+            ep_reward = [x + y for x, y in zip(ep_reward, rewards)]
+            agent.replay_buffer.add(states, actions, rewards, next_states, done)
 
             if i > 2:
                 agent.learn()
@@ -223,10 +226,8 @@ def main():
             if done:
                 ep_rewards.append(ep_reward)
                 if i % 1 == 0:
-                    print("episode: {}\treward: {}".format(i, round(np.mean(ep_rewards), 3)))
+                    print("episode: {}\treward: {}".format(i, [round(sum(x) / len(x), 3) for x in zip(*ep_rewards)]))
                 break
-
-            state = next_state
 
 if __name__ == '__main__':
     main()

@@ -144,11 +144,11 @@ class MADDPG():
     def learn(self):
         # Replay buffer
         states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
-        print(states[0])
         states_all = [torch.FloatTensor(s).to(self.device) for s in states]
         actions_all = torch.FloatTensor(actions).to(self.device)
         rewards_all = torch.FloatTensor(rewards).to(self.device)
-        next_states_all = torch.FloatTensor(next_states).to(self.device)
+        # next_states_all = torch.FloatTensor(next_states).to(self.device)
+        next_states_all = [torch.FloatTensor(ns).to(self.device) for ns in next_states]
         dones = torch.FloatTensor(dones).to(self.device)
         
         # Get next actions of all agents
